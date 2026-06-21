@@ -1,6 +1,9 @@
 name: Build ARM64 & Deploy
 
 on:
+  push:
+    branches:
+      - master
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch:
