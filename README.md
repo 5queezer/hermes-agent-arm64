@@ -42,7 +42,7 @@ gh workflow run build.yml -f force=true
 ## Required GitHub Actions secrets
 
 | Secret | Purpose |
-|---|---|
+| --- | --- |
 | `COOLIFY_URL` | Public Coolify base URL |
 | `COOLIFY_TOKEN` | API token with read, write, and deploy permissions |
 | `COOLIFY_APP_UUID` | Coolify application for `@hermes_chee6Law_bot` |
