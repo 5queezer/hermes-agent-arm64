@@ -158,23 +158,14 @@ def collect_log_text(value: Any) -> str:
     return ""
 
 
-def verifier_marker(target: AppTarget, expected_sha: str) -> str:
-    return (
-        f"verified @{target.expected_username}: gateway running, "
-        f"Codex logged in, revision {expected_sha[:12]}"
-    )
-
-
 def wait_for_deployment(
     client: CoolifyClient,
     deployment_uuid: str,
     app_uuid: str,
     timeout_seconds: int,
     poll_seconds: int,
-    required_marker: str | None = None,
 ) -> None:
     deadline = time.monotonic() + timeout_seconds
-    verification_deadline: float | None = None
     last_status = ""
     while time.monotonic() < deadline:
         deployment = client.get_deployment(deployment_uuid)
@@ -183,21 +174,12 @@ def wait_for_deployment(
             print(f"{app_uuid}: deployment {deployment_uuid} is {status}", flush=True)
             last_status = status
         if status in TERMINAL_SUCCESS:
-            if required_marker is None:
-                return
-            log_text = collect_log_text(deployment.get("logs"))
-            if "Post-deployment command failed." in log_text:
+            log_text = collect_log_text(deployment.get("logs")).lower()
+            if "post-deployment command failed." in log_text:
                 raise DeployError(
-                    f"application {app_uuid} post-deployment verification failed"
+                    f"application {app_uuid} post-deployment command failed"
                 )
-            if required_marker in log_text:
-                return
-            if verification_deadline is None:
-                verification_deadline = min(deadline, time.monotonic() + 60)
-            if time.monotonic() >= verification_deadline:
-                raise DeployError(
-                    f"application {app_uuid} produced no deployment verification evidence"
-                )
+            return
         if status in TERMINAL_FAILURE:
             raise DeployError(
                 f"application {app_uuid} deployment {deployment_uuid} ended as {status}"
@@ -206,6 +188,36 @@ def wait_for_deployment(
     raise DeployError(
         f"application {app_uuid} deployment {deployment_uuid} timed out after "
         f"{timeout_seconds}s"
+    )
+
+
+def wait_for_application_health(
+    client: CoolifyClient,
+    target: AppTarget,
+    image_name: str,
+    image_tag: str,
+    timeout_seconds: int = 180,
+    poll_seconds: int = 5,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    last_status = ""
+    while time.monotonic() < deadline:
+        application = client.get_application(target.uuid)
+        status = str(application.get("status", "unknown")).lower()
+        if status != last_status:
+            print(f"{target.uuid}: application is {status}", flush=True)
+            last_status = status
+        if application.get("docker_registry_image_name") != image_name:
+            raise DeployError(f"application {target.uuid} image name changed unexpectedly")
+        if application.get("docker_registry_image_tag") != image_tag:
+            raise DeployError(f"application {target.uuid} image tag changed unexpectedly")
+        if status in {"healthy", "running:healthy"}:
+            return
+        if status.startswith(("exited", "stopped", "error", "failed")):
+            raise DeployError(f"application {target.uuid} became {status}")
+        time.sleep(poll_seconds)
+    raise DeployError(
+        f"application {target.uuid} did not become healthy after {timeout_seconds}s"
     )
 
 
@@ -234,6 +246,40 @@ def update_payload(
     }
 
 
+def health_payload(target: AppTarget, expected_sha: str) -> dict[str, Any]:
+    command = (
+        "python3 /opt/data/scripts/verify_hermes_deployment.py "
+        f"--expected-username {target.expected_username} "
+        f"--expected-sha {expected_sha} --timeout 20"
+    )
+    return {
+        "health_check_enabled": True,
+        "health_check_type": "command",
+        "health_check_command": command,
+        "health_check_interval": 30,
+        "health_check_timeout": 45,
+        "health_check_retries": 3,
+        "health_check_start_period": 20,
+    }
+
+
+def recovery_payload(old: PreviousConfig, target: AppTarget) -> dict[str, Any]:
+    payload = update_payload(
+        old.image_name,
+        old.image_tag,
+        old.post_deployment_command,
+    )
+    old_sha = re.search(
+        r"--expected-sha ([0-9a-f]{40})",
+        old.post_deployment_command,
+    )
+    if MANAGED_MARKER in old.post_deployment_command and old_sha:
+        payload.update(health_payload(target, old_sha.group(1)))
+    else:
+        payload["health_check_enabled"] = False
+    return payload
+
+
 def rollback(
     client: CoolifyClient,
     updated: list[AppTarget],
@@ -248,26 +294,27 @@ def rollback(
             print(f"{target.uuid}: rolling back to previous image", flush=True)
             client.update_application(
                 target.uuid,
-                update_payload(
-                    old.image_name, old.image_tag, old.post_deployment_command
-                ),
+                recovery_payload(old, target),
             )
             deployment_uuid = client.start_application(target.uuid)
-            required_marker = None
-            old_sha = re.search(
-                r"--expected-sha ([0-9a-f]{40})",
-                old.post_deployment_command,
-            )
-            if MANAGED_MARKER in old.post_deployment_command and old_sha:
-                required_marker = verifier_marker(target, old_sha.group(1))
             wait_for_deployment(
                 client,
                 deployment_uuid,
                 target.uuid,
                 timeout_seconds,
                 poll_seconds,
-                required_marker,
             )
+            old_sha = re.search(
+                r"--expected-sha ([0-9a-f]{40})",
+                old.post_deployment_command,
+            )
+            if MANAGED_MARKER in old.post_deployment_command and old_sha:
+                wait_for_application_health(
+                    client,
+                    target,
+                    old.image_name,
+                    old.image_tag,
+                )
         except DeployError as exc:
             failures.append(f"{target.uuid}: {exc}")
     return failures
@@ -304,10 +351,9 @@ def deploy(args: argparse.Namespace) -> None:
             post_command = managed_post_command(
                 old.post_deployment_command, target, args.tag
             )
-            client.update_application(
-                target.uuid,
-                update_payload(args.image, args.tag, post_command),
-            )
+            payload = update_payload(args.image, args.tag, post_command)
+            payload.update(health_payload(target, args.tag))
+            client.update_application(target.uuid, payload)
             configured.append(target)
 
         for target in args.app:
@@ -322,7 +368,12 @@ def deploy(args: argparse.Namespace) -> None:
                 target.uuid,
                 args.timeout,
                 args.poll_interval,
-                verifier_marker(target, args.tag),
+            )
+            wait_for_application_health(
+                client,
+                target,
+                args.image,
+                args.tag,
             )
             verified.append(target)
     except DeployError as original:
@@ -337,9 +388,7 @@ def deploy(args: argparse.Namespace) -> None:
             try:
                 client.update_application(
                     target.uuid,
-                    update_payload(
-                        old.image_name, old.image_tag, old.post_deployment_command
-                    ),
+                    recovery_payload(old, target),
                 )
             except DeployError as exc:
                 restore_failures.append(f"{target.uuid}: {exc}")

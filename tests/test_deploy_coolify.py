@@ -25,12 +25,14 @@ class FakeClient:
                 "docker_registry_image_name": "old/main",
                 "docker_registry_image_tag": "old-main-tag",
                 "post_deployment_command": "echo main",
+                "status": "running:unknown",
             },
             "career-app": {
                 "build_pack": "dockerimage",
                 "docker_registry_image_name": "old/career",
                 "docker_registry_image_tag": "old-career-tag",
                 "post_deployment_command": "",
+                "status": "running:unknown",
             },
         }
         self.deployment_statuses = iter(deployment_statuses)
@@ -61,6 +63,8 @@ class FakeClient:
             status = "finished"
             logs = "Post-deployment command failed."
         self.deployments[deployment_uuid] = {"status": status, "logs": logs}
+        if status == "finished" and self.apps[uuid].get("health_check_enabled"):
+            self.apps[uuid]["status"] = "running:healthy"
         return deployment_uuid
 
     def get_deployment(self, deployment_uuid: str) -> dict[str, object]:

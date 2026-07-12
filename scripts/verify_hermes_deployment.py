@@ -137,7 +137,9 @@ def verify(expected_username: str, expected_sha: str, timeout: int) -> None:
 
     print(
         f"verified @{actual_username}: gateway running, Codex logged in, "
-        f"revision {actual_sha[:12]}"
+        f"revision {actual_sha[:12]}",
+        file=sys.stderr,
+        flush=True,
     )
 
 
