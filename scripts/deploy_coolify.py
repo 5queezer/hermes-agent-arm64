@@ -254,7 +254,7 @@ def health_payload(target: AppTarget, expected_sha: str) -> dict[str, Any]:
     )
     return {
         "health_check_enabled": True,
-        "health_check_type": "command",
+        "health_check_type": "cmd",
         "health_check_command": command,
         "health_check_interval": 30,
         "health_check_timeout": 45,
