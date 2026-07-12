@@ -1,51 +1,72 @@
 # Hermes Agent ARM64
 
-ARM64 Docker build of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) for deployment on ARM64 servers (e.g. Hetzner CAX, Raspberry Pi, AWS Graviton).
-
-The upstream image on Docker Hub is amd64-only. This repo builds a native ARM64 image via GitHub Actions.
+Production ARM64 builds of
+[NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) for
+the two Hermes Telegram agents hosted on the Hetzner ARM64 server.
 
 ## Image
 
+```text
+ghcr.io/5queezer/hermes-agent-arm64:<upstream-git-sha>
 ```
-ghcr.io/5queezer/hermes-agent-arm64:latest
-```
 
-## Auto-update
+`latest` is also published, but deployments use the immutable 40-character
+upstream Git SHA tag.
 
-A GitHub Actions workflow runs daily at 06:00 UTC:
+## Build and deployment
 
-1. Checks upstream `NousResearch/hermes-agent` HEAD for changes
-2. Builds ARM64 image on a native `ubuntu-24.04-arm` runner (~6 min)
-3. Pushes to GHCR
-4. Triggers Coolify redeploy via API
+`.github/workflows/build.yml` runs daily at 06:00 UTC, on pushes to `master`,
+and on manual dispatch. It:
 
-Manual trigger: `gh workflow run build.yml`
+1. resolves the exact `NousResearch/hermes-agent` HEAD commit;
+2. checks out that commit and builds its upstream Dockerfile on a native ARM64
+   runner;
+3. passes `HERMES_GIT_SHA` so the image reports its source revision;
+4. pushes both the SHA tag and `latest` to GHCR;
+5. updates the Coolify applications for `@hermes_chee6Law_bot` and
+   `@raspi_kerf_bot` to the exact SHA tag;
+6. waits for both asynchronous deployments and their in-container verification
+   commands to finish;
+7. rolls back already-updated applications if a later deployment fails; and
+8. records `.last-upstream-sha` only after both agents are verified.
 
-## Included extras
+A green workflow therefore means both gateway deployments completed. An
+accepted Coolify API request alone is not considered success.
 
-Only the extras needed for a Telegram gateway deployment:
-
-`messaging`, `cron`, `cli`, `pty`, `mcp`, `voice`
-
-The full `[all]` extras hit pip's `resolution-too-deep` limit on ARM64. Install additional extras manually inside the container if needed.
-
-## Configuration
-
-The image starts in **gateway mode** (`CMD ["gateway"]`). Set these environment variables:
-
-| Variable | Required | Description |
-|---|---|---|
-| `TELEGRAM_BOT_TOKEN` | yes | From [@BotFather](https://t.me/BotFather) |
-| `TELEGRAM_ALLOWED_USERS` | yes | Comma-separated numeric Telegram user IDs |
-| `HERMES_HOME` | no | Data directory (default: `/opt/data`) |
-| `HERMES_INFERENCE_PROVIDER` | no | LLM provider (e.g. `openai-codex`) |
-
-For OpenAI Codex, run the OAuth login interactively after first deploy:
+Manual forced deployment:
 
 ```bash
-docker exec -it <container> hermes model --no-browser
+gh workflow run build.yml -f force=true
 ```
+
+## Required GitHub Actions secrets
+
+| Secret | Purpose |
+|---|---|
+| `COOLIFY_URL` | Public Coolify base URL |
+| `COOLIFY_TOKEN` | API token with read, write, and deploy permissions |
+| `COOLIFY_APP_UUID` | Coolify application for `@hermes_chee6Law_bot` |
+| `COOLIFY_CAREER_APP_UUID` | Coolify application for `@raspi_kerf_bot` |
+
+`GITHUB_TOKEN` is supplied automatically and is used to publish to GHCR and
+record the successfully deployed upstream SHA.
+
+## Deployment verification
+
+`scripts/verify_hermes_deployment.py` runs inside each newly deployed gateway
+and checks:
+
+- the baked source SHA matches the requested deployment;
+- the Hermes gateway process is running;
+- OpenAI Codex authentication is logged in; and
+- Telegram `getMe` returns the expected bot username.
+
+The verifier never prints tokens. `scripts/deploy_coolify.py` also avoids
+printing Coolify response bodies because deployment logs can contain secret
+environment values.
 
 ## Persistent data
 
-Mount a volume at `/opt/data` for config, sessions, skills, and credentials.
+Each Coolify application mounts its existing persistent data at `/opt/data`.
+This preserves configuration, sessions, skills, and OAuth credentials across
+immutable image deployments and rollbacks.

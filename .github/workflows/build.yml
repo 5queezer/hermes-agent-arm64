@@ -7,6 +7,16 @@ on:
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild and redeploy even when upstream is unchanged
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: hermes-arm64-production
+  cancel-in-progress: false
 
 env:
   IMAGE: ghcr.io/5queezer/hermes-agent-arm64
@@ -19,66 +29,132 @@ jobs:
       changed: ${{ steps.check.outputs.changed }}
       upstream_sha: ${{ steps.check.outputs.upstream_sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
       - name: Check upstream commit
         id: check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FORCE_INPUT: ${{ inputs.force || false }}
         run: |
-          UPSTREAM_SHA=$(git ls-remote "https://github.com/$UPSTREAM_REPO.git" HEAD | cut -f1)
+          set -euo pipefail
+          UPSTREAM_URL="https://github.com/${UPSTREAM_REPO}.git"
+          UPSTREAM_SHA=$(
+            git ls-remote "$UPSTREAM_URL" HEAD |
+              cut -f1
+          )
+          test -n "$UPSTREAM_SHA"
           echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
           LAST_SHA=$(cat .last-upstream-sha 2>/dev/null || echo "none")
-          if [ "$UPSTREAM_SHA" = "$LAST_SHA" ]; then
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            FORCE_DEPLOY="$FORCE_INPUT"
+          else
+            FORCE_DEPLOY="false"
+          fi
+          if [ "$UPSTREAM_SHA" = "$LAST_SHA" ] && \
+             [ "$FORCE_DEPLOY" != "true" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "No upstream changes ($UPSTREAM_SHA)"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "New upstream: $LAST_SHA → $UPSTREAM_SHA"
+            echo "Deploying upstream: $LAST_SHA → $UPSTREAM_SHA"
           fi
 
-  build:
+  build-and-deploy:
     needs: check
     if: needs.check.outputs.changed == 'true'
     runs-on: ubuntu-24.04-arm
+    env:
+      UPSTREAM_SHA: ${{ needs.check.outputs.upstream_sha }}
     permissions:
       packages: write
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
-      - name: Clone upstream source
-        run: git clone --depth=1 "https://github.com/$UPSTREAM_REPO.git" hermes-agent
+      - name: Clone exact upstream source
+        run: |
+          set -euo pipefail
+          UPSTREAM_URL="https://github.com/${UPSTREAM_REPO}.git"
+          git clone \
+            --filter=blob:none \
+            --no-checkout \
+            "$UPSTREAM_URL" \
+            hermes-agent
+          git -C hermes-agent checkout --detach "$UPSTREAM_SHA"
+          test "$(git -C hermes-agent rev-parse HEAD)" = "$UPSTREAM_SHA"
+
+      - name: Validate deployment tooling
+        run: |
+          python3 -m py_compile \
+            scripts/deploy_coolify.py \
+            scripts/verify_hermes_deployment.py
+          python3 -m unittest discover -s tests -v
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        run: docker buildx create --name hermes-builder --use
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & push ARM64
-        uses: docker/build-push-action@v6
+      - name: Build and push upstream-compatible ARM64 image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
-          context: .
+          context: ./hermes-agent
+          file: ./hermes-agent/Dockerfile
+          platforms: linux/arm64
           push: true
+          build-args: |
+            HERMES_GIT_SHA=${{ env.UPSTREAM_SHA }}
+          labels: |
+            org.opencontainers.image.revision=${{ env.UPSTREAM_SHA }}
           tags: |
             ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:${{ needs.check.outputs.upstream_sha }}
+            ${{ env.IMAGE }}:${{ env.UPSTREAM_SHA }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Track upstream SHA
+      - name: Deploy and verify both Hermes agents
+        env:
+          COOLIFY_URL: ${{ secrets.COOLIFY_URL }}
+          COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+          MAIN_APP_UUID: ${{ secrets.COOLIFY_APP_UUID }}
+          CAREER_APP_UUID: ${{ secrets.COOLIFY_CAREER_APP_UUID }}
         run: |
-          echo "${{ needs.check.outputs.upstream_sha }}" > .last-upstream-sha
+          set -euo pipefail
+          python3 scripts/deploy_coolify.py \
+            --image "$IMAGE" \
+            --tag "$UPSTREAM_SHA" \
+            --app "$MAIN_APP_UUID:@hermes_chee6Law_bot" \
+            --app "$CAREER_APP_UUID:@raspi_kerf_bot"
+
+      - name: Record successfully deployed upstream SHA
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          rm -rf hermes-agent
+          git pull --rebase origin master
+          echo "$UPSTREAM_SHA" > .last-upstream-sha
+          if git diff --quiet -- .last-upstream-sha; then
+            echo "Deployment SHA already recorded."
+            exit 0
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .last-upstream-sha
-          git commit -m "upstream ${{ needs.check.outputs.upstream_sha }}"
-          git push
-
-      - name: Deploy to Coolify
-        run: |
-          curl -sf -X GET \
-            -H "Authorization: Bearer ${{ secrets.COOLIFY_TOKEN }}" \
-            "${{ secrets.COOLIFY_URL }}/api/v1/deploy?uuid=${{ secrets.COOLIFY_APP_UUID }}&force=true"
+          git commit -m "deployed upstream $UPSTREAM_SHA"
+          AUTH_HEADER=$(
+            printf 'x-access-token:%s' "$GITHUB_TOKEN" |
+              base64 -w0
+          )
+          GIT_AUTH_CONFIG="http.https://github.com/.extraheader="
+          GIT_AUTH_CONFIG+="AUTHORIZATION: basic $AUTH_HEADER"
+          git -c "$GIT_AUTH_CONFIG" push origin HEAD:master
