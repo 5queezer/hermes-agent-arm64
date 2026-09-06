@@ -87,10 +87,14 @@ jobs:
           git -C hermes-agent checkout --detach "$UPSTREAM_SHA"
           test "$(git -C hermes-agent rev-parse HEAD)" = "$UPSTREAM_SHA"
 
+      - name: Prepare image for production startup
+        run: python3 scripts/prepare_upstream_dockerfile.py hermes-agent/Dockerfile
+
       - name: Validate deployment tooling
         run: |
           python3 -m py_compile \
             scripts/deploy_coolify.py \
+            scripts/prepare_upstream_dockerfile.py \
             scripts/verify_hermes_deployment.py
           python3 -m unittest discover -s tests -v
 
