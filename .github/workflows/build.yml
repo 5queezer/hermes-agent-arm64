@@ -87,6 +87,15 @@ jobs:
           git -C hermes-agent checkout --detach "$UPSTREAM_SHA"
           test "$(git -C hermes-agent rev-parse HEAD)" = "$UPSTREAM_SHA"
 
+      - name: Stamp exact upstream revision
+        run: |
+          python3 hermes-agent/scripts/write_install_stamp.py \
+            --output hermes-agent/install-stamp.json \
+            --commit "$UPSTREAM_SHA" \
+            --distribution docker \
+            --update-mechanism external \
+            --source ci
+
       - name: Prepare image for production startup
         run: python3 scripts/prepare_upstream_dockerfile.py hermes-agent/Dockerfile
 
@@ -124,6 +133,13 @@ jobs:
             ${{ env.IMAGE }}:${{ env.UPSTREAM_SHA }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Verify published image revision before deployment
+        run: |
+          set -euo pipefail
+          ACTUAL_SHA=$(docker run --rm --network none --pull always \
+            --entrypoint cat "$IMAGE:$UPSTREAM_SHA" /opt/hermes/.hermes_build_sha)
+          test "$ACTUAL_SHA" = "$UPSTREAM_SHA"
 
       - name: Deploy and verify both Hermes agents
         env:
