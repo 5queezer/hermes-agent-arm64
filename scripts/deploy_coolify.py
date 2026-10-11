@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Deploy an exact Hermes image to multiple Coolify applications.
 
-The script updates every application to the same immutable image tag, starts
-and polls each deployment, and rolls already-updated applications back if any
-application fails. It deliberately prints no application environment values or
-Coolify response logs because those can contain credentials.
+The script stops each application before replacing its image because rolling
+containers cannot safely share Hermes' persistent gateway lock. It polls each
+deployment and rolls updated applications back if any deployment fails. It
+deliberately prints no application environment values or Coolify response logs
+because those can contain credentials.
 """
 
 from __future__ import annotations
@@ -117,6 +118,9 @@ class CoolifyClient:
             raise DeployError(f"Coolify did not queue a deployment for {uuid}")
         return deployment_uuid
 
+    def stop_application(self, uuid: str) -> None:
+        self.request("POST", f"/applications/{uuid}/stop?docker_cleanup=true")
+
     def get_deployment(self, deployment_uuid: str) -> dict[str, Any]:
         return self.request("GET", f"/deployments/{deployment_uuid}")
 
@@ -221,6 +225,42 @@ def wait_for_application_health(
     )
 
 
+def application_is_stopped(application: dict[str, Any]) -> bool:
+    status = str(application.get("status", "")).lower()
+    return status.startswith(("stopped", "exited")) or status in {
+        "inactive",
+        "not running",
+    }
+
+
+def stop_and_wait(
+    client: CoolifyClient,
+    target: AppTarget,
+    timeout_seconds: int = 120,
+    poll_seconds: int = 2,
+) -> None:
+    application = client.get_application(target.uuid)
+    if application_is_stopped(application):
+        return
+
+    print(f"{target.uuid}: stopping before image replacement", flush=True)
+    client.stop_application(target.uuid)
+    deadline = time.monotonic() + timeout_seconds
+    last_status = ""
+    while time.monotonic() < deadline:
+        application = client.get_application(target.uuid)
+        status = str(application.get("status", "unknown")).lower()
+        if status != last_status:
+            print(f"{target.uuid}: application is {status}", flush=True)
+            last_status = status
+        if application_is_stopped(application):
+            return
+        time.sleep(poll_seconds)
+    raise DeployError(
+        f"application {target.uuid} did not stop after {timeout_seconds}s"
+    )
+
+
 def previous_config(application: dict[str, Any], uuid: str) -> PreviousConfig:
     image_name = application.get("docker_registry_image_name")
     image_tag = application.get("docker_registry_image_tag")
@@ -292,6 +332,7 @@ def rollback(
         old = previous[target.uuid]
         try:
             print(f"{target.uuid}: rolling back to previous image", flush=True)
+            stop_and_wait(client, target)
             client.update_application(
                 target.uuid,
                 recovery_payload(old, target),
@@ -342,11 +383,12 @@ def deploy(args: argparse.Namespace) -> None:
             raise DeployError(f"application {target.uuid} is not a Docker image app")
         previous[target.uuid] = previous_config(application, target.uuid)
 
-    configured: list[AppTarget] = []
-    attempted: list[AppTarget] = []
+    stopped: list[AppTarget] = []
     verified: list[AppTarget] = []
     try:
         for target in args.app:
+            stop_and_wait(client, target)
+            stopped.append(target)
             old = previous[target.uuid]
             post_command = managed_post_command(
                 old.post_deployment_command, target, args.tag
@@ -354,14 +396,10 @@ def deploy(args: argparse.Namespace) -> None:
             payload = update_payload(args.image, args.tag, post_command)
             payload.update(health_payload(target, args.tag))
             client.update_application(target.uuid, payload)
-            configured.append(target)
-
-        for target in args.app:
             print(
                 f"{target.uuid}: deploying {args.image}:{args.tag}", flush=True
             )
             deployment_uuid = client.start_application(target.uuid)
-            attempted.append(target)
             wait_for_deployment(
                 client,
                 deployment_uuid,
@@ -377,33 +415,16 @@ def deploy(args: argparse.Namespace) -> None:
             )
             verified.append(target)
     except DeployError as original:
-        # A queued deployment can activate the new image even when Coolify
-        # reports a post-deployment verification failure. Compensate every
-        # attempted deployment, not only the ones that verified successfully.
-        restore_failures: list[str] = []
-        for target in configured:
-            if target in attempted:
-                continue
-            old = previous[target.uuid]
-            try:
-                client.update_application(
-                    target.uuid,
-                    recovery_payload(old, target),
-                )
-            except DeployError as exc:
-                restore_failures.append(f"{target.uuid}: {exc}")
         rollback_failures = rollback(
             client,
-            attempted,
+            stopped,
             previous,
             args.timeout,
             args.poll_interval,
         )
-        recovery_failures = restore_failures + rollback_failures
-        if recovery_failures:
+        if rollback_failures:
             raise DeployError(
-                f"{original}; recovery also failed for: "
-                f"{'; '.join(recovery_failures)}"
+                f"{original}; recovery also failed for: {'; '.join(rollback_failures)}"
             ) from original
         raise
 

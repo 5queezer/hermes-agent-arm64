@@ -38,15 +38,24 @@ class FakeClient:
         self.deployment_statuses = iter(deployment_statuses)
         self.deployments: dict[str, dict[str, object]] = {}
         self.started: list[str] = []
+        self.stopped: list[str] = []
+        self.events: list[tuple[str, str]] = []
 
     def get_application(self, uuid: str) -> dict[str, object]:
         return dict(self.apps[uuid])
 
     def update_application(self, uuid: str, payload: dict[str, object]) -> None:
+        self.events.append(("update", uuid))
         self.apps[uuid].update(payload)
+
+    def stop_application(self, uuid: str) -> None:
+        self.events.append(("stop", uuid))
+        self.stopped.append(uuid)
+        self.apps[uuid]["status"] = "stopped"
 
     def start_application(self, uuid: str) -> str:
         deployment_uuid = f"deployment-{len(self.started) + 1}"
+        self.events.append(("start", uuid))
         self.started.append(uuid)
         requested_status = next(self.deployment_statuses)
         usernames = {
@@ -63,8 +72,11 @@ class FakeClient:
             status = "finished"
             logs = "Post-deployment command failed."
         self.deployments[deployment_uuid] = {"status": status, "logs": logs}
-        if status == "finished" and self.apps[uuid].get("health_check_enabled"):
-            self.apps[uuid]["status"] = "running:healthy"
+        if status == "finished":
+            health = self.apps[uuid].get("health_check_enabled")
+            self.apps[uuid]["status"] = (
+                "running:healthy" if health else "running:unknown"
+            )
         return deployment_uuid
 
     def get_deployment(self, deployment_uuid: str) -> dict[str, object]:
@@ -103,6 +115,18 @@ class DeployTests(unittest.TestCase):
         ):
             MODULE.deploy(args())
         self.assertEqual(client.started, ["main-app", "career-app"])
+        self.assertEqual(client.stopped, ["main-app", "career-app"])
+        self.assertEqual(
+            client.events,
+            [
+                ("stop", "main-app"),
+                ("update", "main-app"),
+                ("start", "main-app"),
+                ("stop", "career-app"),
+                ("update", "career-app"),
+                ("start", "career-app"),
+            ],
+        )
         for app in client.apps.values():
             self.assertEqual(
                 app["docker_registry_image_name"],
@@ -122,6 +146,10 @@ class DeployTests(unittest.TestCase):
             MODULE.deploy(args())
         self.assertEqual(
             client.started,
+            ["main-app", "career-app", "career-app", "main-app"],
+        )
+        self.assertEqual(
+            client.stopped,
             ["main-app", "career-app", "career-app", "main-app"],
         )
         self.assertEqual(client.apps["main-app"]["docker_registry_image_name"], "old/main")
