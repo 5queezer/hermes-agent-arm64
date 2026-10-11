@@ -48,9 +48,15 @@ def gateway_running() -> bool:
             )
         except (OSError, PermissionError):
             continue
-        if re.search(
-            r"(?:^|\s)(?:\S*/)?hermes\s+gateway\s+run(?:\s|$)", command
-        ):
+        direct_command = re.search(
+            r"(?:^|\s)(?:\S*/)?hermes\s+gateway\s+run(?:\s|$)",
+            command,
+        )
+        python_launcher = re.search(
+            r"sys\.argv\[0\]\s*=\s*['\"]hermes['\"]", command
+        )
+        gateway_arguments = re.search(r"(?:^|\s)gateway\s+run(?:\s|$)", command)
+        if direct_command or (python_launcher and gateway_arguments):
             return True
     return False
 
