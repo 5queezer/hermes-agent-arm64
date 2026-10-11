@@ -24,16 +24,18 @@ class PrepareUpstreamDockerfileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             dockerfile = Path(temp_dir) / "Dockerfile"
             dockerfile.write_text(
-                f"FROM debian:13.4\nRUN apt-get install -y \\\n+{RUNTIME_PACKAGES} && true\n",
+                f"FROM debian:13.4\nRUN apt-get install -y \\\n{RUNTIME_PACKAGES} && true\n"
+                "FROM python_deps AS runtime\n",
                 encoding="utf-8",
             )
 
             MODULE.prepare(dockerfile)
 
-            self.assertIn(
-                "ca-certificates curl sudo iputils-ping",
-                dockerfile.read_text(encoding="utf-8"),
-            )
+            prepared = dockerfile.read_text(encoding="utf-8")
+            self.assertIn("ca-certificates curl sudo iputils-ping", prepared)
+            self.assertIn("ARG HERMES_GIT_SHA", prepared)
+            self.assertIn("/opt/hermes/.hermes_build_sha", prepared)
+            self.assertIn('"[0-9a-f]{40}"', prepared)
 
     def test_prepare_fails_closed_when_upstream_layout_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -41,4 +43,15 @@ class PrepareUpstreamDockerfileTests(unittest.TestCase):
             dockerfile.write_text("FROM debian:13.4\n", encoding="utf-8")
 
             with self.assertRaisesRegex(RuntimeError, "runtime package list"):
+                MODULE.prepare(dockerfile)
+
+    def test_prepare_fails_closed_when_runtime_stage_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dockerfile = Path(temp_dir) / "Dockerfile"
+            dockerfile.write_text(
+                f"RUN apt-get install -y \\\n{RUNTIME_PACKAGES} && true\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "runtime stage"):
                 MODULE.prepare(dockerfile)
